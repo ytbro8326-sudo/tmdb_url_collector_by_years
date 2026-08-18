@@ -1,0 +1,179 @@
+name: PrimeSrc Pipeline
+
+on:
+  schedule:
+    # Runs daily at 00:00 UTC automatically for TMDB Now Playing & Top Rated movies
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Execution mode'
+        required: true
+        type: choice
+        options:
+          - 'both (process tmdb_movie_input_list.txt AND TMDB Now-Playing/Top-Rated)'
+          - 'manual_only (tmdb_movie_input_list.txt ONLY)'
+          - 'latest_only (lastet_released_holly_bolly_movies_list.txt ONLY)'
+        default: 'both (process tmdb_movie_input_list.txt AND TMDB Now-Playing/Top-Rated)'
+      latest_limit:
+        description: 'Number of movies to fetch from TMDB (Now Playing + Top Rated)'
+        required: false
+        type: number
+        default: 50
+      skip_stage1:
+        description: 'Skip Stage 1'
+        required: false
+        type: boolean
+        default: false
+      skip_stage2:
+        description: 'Skip Stage 2 (only collect keys, no FlareSolverr)'
+        required: false
+        type: boolean
+        default: false
+      media_type:
+        description: 'Media type (movie or tv)'
+        required: false
+        type: choice
+        options:
+          - movie
+          - tv
+        default: movie
+
+permissions:
+  contents: write
+
+jobs:
+  extract-urls:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # ── FlareSolverr ──────────────────────────────────────────────
+      # Pulls the official image and starts it on port 8191.
+      - name: Start FlareSolverr
+        run: |
+          docker pull ghcr.io/flaresolverr/flaresolverr:latest
+          docker run -d \
+            --name flaresolverr \
+            -p 8191:8191 \
+            -e LOG_LEVEL=info \
+            ghcr.io/flaresolverr/flaresolverr:latest
+
+      - name: Wait for FlareSolverr to be ready
+        run: |
+          echo "Waiting for FlareSolverr health endpoint..."
+          for i in $(seq 1 30); do
+            STATUS=$(curl -s http://localhost:8191/health | python3 -c "import sys,json; print(json.load(sys.stdin).get('status',''))" 2>/dev/null || true)
+            if [ "$STATUS" = "ok" ]; then
+              echo "FlareSolverr is ready (attempt $i)"
+              break
+            fi
+            echo "  attempt $i — not ready yet, sleeping 2s..."
+            sleep 2
+          done
+          # Final verification
+          curl -sf http://localhost:8191/health || (echo "FlareSolverr failed to start" && exit 1)
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+
+      # ── Ensure all input and output files exist ──────────────────
+      - name: Ensure all input and output files exist
+        run: |
+          touch tmdb_movie_input_list.txt
+          touch lastet_released_holly_bolly_movies_list.txt
+          touch output_stage1_api_urls_list_found.txt
+          touch output_stage1_api_urls_list_not_found.txt
+          touch final_stream_urls_stage2.txt
+          touch already_processed_urls_list.txt
+          touch errorsfaced.txt
+          if [ ! -f "movie_streaming_data.json" ]; then
+            echo "[]" > movie_streaming_data.json
+          fi
+
+      # ── Run the pipeline ─────────────────────────────────────────
+      - name: Run PrimeSrc Pipeline
+        run: |
+          CMD="python primesrc.py"
+
+          # Automatic scheduled daily run: only process latest_released_holly_bolly_movies_list.txt (skip tmdb_movie_input_list.txt)
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            echo "Running in automated daily schedule mode (latest Hollywood/Bollywood only)"
+            CMD="$CMD --no-manual-input --fetch-latest"
+          else
+            # Manual run via workflow_dispatch
+            MODE="${{ github.event.inputs.mode }}"
+            if [[ "$MODE" == *"manual_only"* ]]; then
+              CMD="$CMD --no-latest-input --no-fetch-latest --include-manual-input"
+            elif [[ "$MODE" == *"latest_only"* ]]; then
+              CMD="$CMD --no-manual-input --include-latest-input --fetch-latest"
+            else
+              CMD="$CMD --include-manual-input --include-latest-input --fetch-latest"
+            fi
+          fi
+
+          if [ -n "${{ github.event.inputs.latest_limit }}" ]; then
+            CMD="$CMD --latest-limit ${{ github.event.inputs.latest_limit }}"
+          fi
+
+          if [ "${{ github.event.inputs.skip_stage1 }}" = "true" ]; then
+            CMD="$CMD --skip-stage1"
+          fi
+
+          if [ "${{ github.event.inputs.skip_stage2 }}" = "true" ]; then
+            CMD="$CMD --skip-stage2"
+          fi
+
+          if [ -n "${{ github.event.inputs.media_type }}" ]; then
+            CMD="$CMD --type ${{ github.event.inputs.media_type }}"
+          fi
+
+          echo "Running: $CMD"
+          $CMD
+        env:
+          FLARESOLVERR_URL: http://localhost:8191
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+          GH_REPO: danka1567/primesrc_data
+          GH_BRANCH: main
+        continue-on-error: true
+
+      # ── Collect FlareSolverr logs on failure ─────────────────────
+      - name: FlareSolverr logs (on failure)
+        if: failure()
+        run: docker logs flaresolverr || true
+
+      # ── Commit & push all input/output files back to main repo ───
+      - name: Save all pipeline files to repo
+        if: always()
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Stage all base and auto-split output files
+          git add tmdb_movie_input_list*.txt 2>/dev/null || true
+          git add lastet_released_holly_bolly_movies_list*.txt 2>/dev/null || true
+          git add output_stage1_api_urls_list_found*.txt 2>/dev/null || true
+          git add output_stage1_api_urls_list_not_found*.txt 2>/dev/null || true
+          git add final_stream_urls_stage2*.txt 2>/dev/null || true
+          git add movie_streaming_data*.json 2>/dev/null || true
+          git add already_processed_urls_list*.txt 2>/dev/null || true
+          git add errorsfaced*.txt 2>/dev/null || true
+
+          # Commit only if there is something new to commit
+          if git diff --cached --quiet; then
+            echo "No file changes to commit."
+          else
+            git commit -m "Pipeline run: update output files [$(date -u '+%Y-%m-%dT%H:%M:%SZ')]"
+            git push origin HEAD:main
+            echo "Files committed and pushed to main."
+          fi
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -1,0 +1,109 @@
+name: TMDB Movie Extractor Pipeline
+
+on:
+  schedule:
+    # Runs weekly on Sunday at 02:00 UTC
+    - cron: '0 2 * * 0'
+  workflow_dispatch:
+    inputs:
+      start_year:
+        description: 'Start Year (e.g. 1950, 2020, 2025, 2026)'
+        required: true
+        type: number
+        default: 2025
+      end_year:
+        description: 'End Year (e.g. 1950, 2025, 2026)'
+        required: true
+        type: number
+        default: 2025
+      category:
+        description: 'Category to extract'
+        required: true
+        type: choice
+        options:
+          - both
+          - hollywood
+          - bollywood
+        default: both
+      extract_highest_grossing:
+        description: 'Extract Highest Grossing lists (revenue.desc)'
+        required: false
+        type: boolean
+        default: true
+      max_pages:
+        description: 'Maximum TMDB pages per category/year (1-500)'
+        required: false
+        type: number
+        default: 500
+
+permissions:
+  contents: write
+
+jobs:
+  extract-and-sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+
+      - name: Ensure output directory exists
+        run: |
+          mkdir -p vixsrcrender/tmdb_movie_lists
+
+      # ── Execute Extractor with GitHub Built-in REST API Sync ─────
+      - name: Run TMDB Movie Extractor & GitHub API Sync
+        run: |
+          cd vixsrcrender
+          
+          # Default values for scheduled runs
+          START_Y="${{ github.event.inputs.start_year || '2025' }}"
+          END_Y="${{ github.event.inputs.end_year || '2025' }}"
+          CAT="${{ github.event.inputs.category || 'both' }}"
+          MAX_P="${{ github.event.inputs.max_pages || '500' }}"
+          
+          CMD="python tmdb_movie_extractor.py $START_Y $END_Y $CAT --max-pages $MAX_P"
+          
+          if [ "${{ github.event.inputs.extract_highest_grossing }}" = "false" ]; then
+            CMD="$CMD --no-highest-grossing"
+          else
+            CMD="$CMD --highest-grossing"
+          fi
+          
+          echo "Executing: $CMD"
+          $CMD
+        env:
+          # Built-in GitHub Token & Repository Context
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          GH_BRANCH: ${{ github.ref_name || 'main' }}
+          TMDB_API_KEY: ${{ secrets.TMDB_API_KEY || '6fad3f86b8452ee232deb7977d7dcf58' }}
+
+      # ── Git Commit & Push (Dual Verification / Batch Sync) ───────
+      - name: Commit & Push updated list files to repo
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Stage all extracted movie lists
+          git add vixsrcrender/tmdb_movie_lists/*.txt 2>/dev/null || true
+
+          if git diff --cached --quiet; then
+            echo "All files already synced via GitHub API or no changes."
+          else
+            git commit -m "Update TMDB movie lists [$(date -u '+%Y-%m-%dT%H:%M:%SZ')]"
+            git push origin HEAD:${{ github.ref_name || 'main' }}
+            echo "Output files committed and pushed to repo."
+          fi
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
